@@ -1,0 +1,12 @@
+# Virtual Environment
+venv/
+__pycache__/
+*.pyc
+
+# Local Data and Weights (Large files)
+*.pt
+*.parquet
+test_patch/
+*.zip
+.vscode/
+.DS_Store
