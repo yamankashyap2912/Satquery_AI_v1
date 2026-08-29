@@ -1,268 +1,553 @@
 import os
-import re
 import io
-import requests
+import json
+import tempfile
+import datetime
+import torch
 import numpy as np
+import rasterio
+import pandas as pd
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+import plotly.express as px
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+from configilm.ConfigILM import ILMConfiguration, ConfigILM, ILMType
+from configilm.util import get_default_tokenizer
+from configilm.extra.BENv2_utils import band_combi_to_mean_std
 
-# -----------------------------------------------------------------------------
-# 1. EARTH ENGINE INITIALIZATION FIX
-# -----------------------------------------------------------------------------
-import ee
+# ----------------------------------------------------------------------------
+# Page Config & Styling
+# ----------------------------------------------------------------------------
+st.set_page_config(page_title="SatQuery AI — ISRO SIH 26167", page_icon="🛰️", layout="wide")
 
-# REPLACE 'your-gcp-project-id' WITH YOUR GOOGLE CLOUD PROJECT NAME
-GEE_PROJECT_ID = os.getenv("GEE_PROJECT_ID", "your-gcp-project-id")
-
-@st.cache_resource
-def init_earth_engine():
-    try:
-        ee.Initialize(project=GEE_PROJECT_ID)
-        return True, "Earth Engine initialized successfully."
-    except Exception as e:
-        return False, f"GEE Init Notice: Call ee.Authenticate() first or set project ID. ({str(e)})"
-
-gee_ready, gee_msg = init_earth_engine()
-
-# -----------------------------------------------------------------------------
-# 2. HELPER: PRESENTABLE MODEL OUTPUT & BOUNDING BOX OVERLAY
-# -----------------------------------------------------------------------------
-def parse_and_overlay_bbox(image: Image.Image, raw_output: str, confidence: float):
-    """
-    Parses normalized bbox string '[ymin xmin ymax xmax]' or '[0.0 0.89, 0.15 1.0]'
-    and overlays a visible bounding box on the image for human users.
-    """
-    img_copy = image.copy().convert("RGB")
-    width, height = img_copy.size
-    
-    # Extract numerical floats from coordinate string
-    coords = [float(x) for x in re.findall(r"[-+]?\d*\.\d+|\d+", raw_output)]
-    
-    description = ""
-    if len(coords) == 4:
-        ymin, xmin, ymax, xmax = coords
-        
-        # Denormalize to pixel coordinates
-        left = int(xmin * width)
-        top = int(ymin * height)
-        right = int(xmax * width)
-        bottom = int(ymax * height)
-        
-        # Draw bounding box
-        draw = ImageDraw.Draw(img_copy)
-        draw.rectangle([left, top, right, bottom], outline="#FF0000", width=4)
-        
-        # Quadrant summary for human presentation
-        h_center = (xmin + xmax) / 2
-        v_center = (ymin + ymax) / 2
-        h_pos = "Left" if h_center < 0.4 else ("Right" if h_center > 0.6 else "Center")
-        v_pos = "Top" if v_center < 0.4 else ("Bottom" if v_center > 0.6 else "Middle")
-        
-        conf_pct = round(confidence * 100, 2)
-        description = f"Arable/Target region detected at **{v_pos}-{h_pos}** section (Confidence: **{conf_pct}%**)."
-    else:
-        conf_pct = round(confidence * 100, 2)
-        description = f"Classification Result: **{raw_output}** (Confidence: **{conf_pct}%**)."
-
-    return img_copy, description
-
-# -----------------------------------------------------------------------------
-# 3. HELPER: SMARTLY AGENT INTEGRATION (`SatQuery Geo-Parser`)
-# -----------------------------------------------------------------------------
-def query_smartly_agent(user_query: str, api_key: str = "", endpoint: str = ""):
-    """
-    Sends natural language queries to your deployed SatQuery Geo-Parser agent on Smartly.
-    """
-    if not api_key or not endpoint:
-        # Local mock parser if API details aren't passed yet
-        return {
-            "status": "success (local mockup)",
-            "parsed_intent": "Target Detection / Land Classification",
-            "extracted_entities": {
-                "location": "User Selected Region",
-                "bands": ["Sentinel-1 (VV, VH)", "Sentinel-2 (RGB)"],
-                "raw_query": user_query
-            }
-        }
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {"message": user_query}
-    
-    try:
-        response = requests.post(endpoint, json=payload, headers=headers, timeout=12)
-        if response.status_code == 200:
-            return response.json()
-        return {"error": f"HTTP {response.status_code}: {response.text}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-# -----------------------------------------------------------------------------
-# 4. HELPER: 50-YEAR TEMPORAL PATCH DOWNLOAD (LANDSAT 1985 vs 2024)
-# -----------------------------------------------------------------------------
-def get_historical_patch_urls(lon: float, lat: float, buffer_m: int = 2000):
-    if not gee_ready:
-        return None, None, "Google Earth Engine is not initialized with a valid project ID."
-    
-    try:
-        point = ee.Geometry.Point([lon, lat])
-        roi = point.buffer(buffer_m).bounds()
-        
-        # 1985 Patch (Landsat 5)
-        l5_1985 = (ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
-                   .filterBounds(roi)
-                   .filterDate('1985-01-01', '1985-12-31')
-                   .sort('CLOUD_COVER')
-                   .first())
-        
-        # 2024 Patch (Landsat 9)
-        l9_2024 = (ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
-                   .filterBounds(roi)
-                   .filterDate('2024-01-01', '2024-12-31')
-                   .sort('CLOUD_COVER')
-                   .first())
-        
-        url_1985 = l5_1985.getDownloadURL({'region': roi, 'scale': 30, 'format': 'GEO_TIFF'})
-        url_2024 = l9_2024.getDownloadURL({'region': roi, 'scale': 30, 'format': 'GEO_TIFF'})
-        
-        return url_1985, url_2024, "Success"
-    except Exception as e:
-        return None, None, str(e)
-
-# -----------------------------------------------------------------------------
-# 5. STREAMLIT UI LAYOUT
-# -----------------------------------------------------------------------------
-st.set_page_config(page_title="SatQuery AI", page_icon="🛰️", layout="wide")
-
-# Custom Dark Theme Styling matching Smartly & SatQuery UI
 st.markdown("""
 <style>
-    .stApp { background-color: #0d1117; color: #c9d1d9; }
-    .metric-card { background-color: #161b22; padding: 15px; border-radius: 8px; border: 1px solid #30363d; }
-    .stButton>button { background-color: #238636; color: white; border-radius: 6px; }
+    .main > div { padding-top: 1.5rem; }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] { padding: 10px 20px; border-radius: 8px 8px 0 0; font-weight: 600; }
+    .answer-banner { background: linear-gradient(135deg, #0f9d5815, #0f9d5805); border-left: 5px solid #0f9d58; border-radius: 8px; padding: 18px; font-size: 1.15rem; margin-bottom: 12px;}
+    .answer-banner-lowconf { background: linear-gradient(135deg, #d9822815, #d9822805); border-left: 5px solid #d98228; }
+    .title-banner { display: flex; align-items: center; gap: 15px; margin-bottom: 5px; }
+    .isro-badge { background-color: #0b3d91; color: white; padding: 5px 12px; border-radius: 6px; font-size: 0.9rem; font-weight: bold; letter-spacing: 1px;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛰️ SatQuery AI - Multimodal Earth Observation Assistant")
-st.caption("Interactive Vision-Language Assistant for Remote Sensing & Historical Change Detection")
+st.markdown('<div class="title-banner"><span class="isro-badge">ISRO SIH PS 26167</span><h1>🛰️ SatQuery AI</h1></div>', unsafe_allow_html=True)
+st.caption("Interactive Vision-Language Assistant for Multimodal Remote Sensing Image Analysis")
 
-# Sidebar - Smartly Agent Configuration & GEE Status
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    
-    st.subheader("Smartly Infra Integration")
-    smartly_api_key = st.text_input("Smartly API Key", type="password", help="Enter key from your Smartly dashboard")
-    smartly_endpoint = st.text_input("Agent Endpoint URL", value="https://api.smartlyinfra.com/v1/agents/satquery-geo-parser/chat")
-    
-    st.divider()
-    st.subheader("Google Earth Engine Status")
-    if gee_ready:
-        st.success("GEE Status: Connected")
-    else:
-        st.warning(gee_msg)
-        st.info("To fix GEE error, set GEE_PROJECT_ID environment variable or pass project ID in ee.Initialize().")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+S2_BANDS_V020 = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
+S1_BANDS = ["VV", "VH"]
+BEN19_CLASSES = [
+    'Agro-forestry areas', 'Arable land', 'Beaches, dunes, sands', 'Broad-leaved forest',
+    'Coastal wetlands', 'Complex cultivation patterns', 'Coniferous forest',
+    'Industrial or commercial units', 'Inland waters', 'Inland wetlands',
+    'Land principally occupied by agriculture, with significant areas of natural vegetation',
+    'Marine waters', 'Mixed forest', 'Moors, heathland and sclerophyllous vegetation',
+    'Natural grassland and sparsely vegetated areas', 'Pastures', 'Permanent crops',
+    'Transitional woodland, shrub', 'Urban fabric'
+]
 
-# Main Dashboard Navigation
-tab1, tab2, tab3 = st.tabs(["🔍 Multimodal VQA & Visualizer", "🤖 SatQuery Geo-Parser Agent", "⏳ 50-Year Multi-Temporal Download"])
+LOW_CONFIDENCE_THRESHOLD = 0.25  # below this, we say so plainly instead of pretending certainty
 
-# -----------------------------------------------------------------------------
-# TAB 1: PRESENTABLE MULTIMODAL VQA
-# -----------------------------------------------------------------------------
-with tab1:
-    st.subheader("1. Visual Question Answering & Detection")
-    
-    col_input, col_meta = st.columns([2, 1])
-    
-    with col_input:
-        query_text = st.selectbox(
-            "Query aligned with PS reference categories:",
-            [
-                "Is there arable land in this image?",
-                "Identify water bodies and river courses.",
-                "Detect urban infrastructure expansion."
-            ]
-        )
-        run_btn = st.button("🚀 Run AI Analysis")
+# ----------------------------------------------------------------------------
+# Image processing & normalization (unchanged from v3 — this part was good)
+# ----------------------------------------------------------------------------
+def normalize_img(arr):
+    arr_min, arr_max = np.nanpercentile(arr, 2), np.nanpercentile(arr, 98)
+    if arr_max == arr_min:
+        return np.zeros_like(arr)
+    return np.clip((arr - arr_min) / (arr_max - arr_min), 0, 1)
 
-    with col_meta:
-        st.markdown("""
-        <div class="metric-card">
-            <h4>Input Fusion</h4>
-            <p>12 Channels (VV, VH, Optical)</p>
-            <p><strong>Vocabulary:</strong> 579 Classes</p>
-        </div>
-        """, unsafe_allow_html=True)
+def get_rgb(s2_arrays):
+    return normalize_img(np.stack([s2_arrays["B04"], s2_arrays["B03"], s2_arrays["B02"]], axis=-1))
 
-    if run_btn:
-        st.markdown("---")
-        st.markdown("### 📊 AI Inference Results")
-        
-        # Raw VLM Output Simulation from screenshot
-        raw_vlm_coordinate_str = "[0.0 0.89, 0.15 1.0]"
-        confidence_val = 0.0042  # 0.42%
-        
-        # Create dummy patch image for visual proof
-        sample_img = Image.new('RGB', (400, 400), color=(34, 139, 34))
-        
-        # Apply readable formatting and draw bounding box
-        annotated_img, user_friendly_msg = parse_and_overlay_bbox(sample_img, raw_vlm_coordinate_str, confidence_val)
-        
-        # Display presentable results to user
-        res_col1, res_col2 = st.columns([1, 1])
-        
-        with res_col1:
-            st.markdown(f"**Question:** {query_text}")
-            st.markdown(f"**Human-Readable Answer:** {user_friendly_msg}")
-            st.markdown(f"**Raw Model Token Output:** `{raw_vlm_coordinate_str}`")
-            st.progress(float(confidence_val * 10), text=f"Top Confidence Score: {confidence_val*100:.2f}%")
+def get_false_color(s2_arrays):
+    return normalize_img(np.stack([s2_arrays["B08"], s2_arrays["B04"], s2_arrays["B03"]], axis=-1))
 
-        with res_col2:
-            st.image(annotated_img, caption="Detected Region Highlighted (Bounding Box Overlay)", use_container_width=True)
+def get_sar_composite(s1_arrays):
+    vv, vh = s1_arrays["VV"], s1_arrays["VH"]
+    ratio = np.clip(vv / (vh + 1e-8), -10, 10)
+    return normalize_img(np.stack([vv, vh, ratio], axis=-1))
 
-# -----------------------------------------------------------------------------
-# TAB 2: SMARTLY AGENT INTEGRATION
-# -----------------------------------------------------------------------------
-with tab2:
-    st.subheader("2. SatQuery Geo-Parser Agent Interface")
-    st.write("Parse complex natural language queries into structured parameters for downstream execution.")
-    
-    agent_input = st.text_area("Enter Geospatial Query:", "Find arable land around Prayagraj using Sentinel-2 optical bands from mid 2024.")
-    
-    if st.button("Query Smartly Agent"):
-        with st.spinner("Processing through SatQuery Geo-Parser..."):
-            agent_result = query_smartly_agent(agent_input, smartly_api_key, smartly_endpoint)
-            st.markdown("### Agent Output Breakdown")
-            st.json(agent_result)
+def get_ndvi(s2_arrays):
+    b8, b4 = s2_arrays["B08"], s2_arrays["B04"]
+    return np.clip((b8 - b4) / (b8 + b4 + 1e-8), -1, 1)
 
-# -----------------------------------------------------------------------------
-# TAB 3: 50-YEAR HISTORICAL GAP ANALYSIS & PATCH DOWNLOAD
-# -----------------------------------------------------------------------------
-with tab3:
-    st.subheader("3. 50-Year Multi-Temporal Patch Extractor")
-    st.write("Compare the exact same coordinate location across a 50-year gap (1985 Landsat 5 vs 2024 Landsat 9).")
-    
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        lon_val = st.number_input("Longitude", value=81.8463, format="%.4f")
-    with c2:
-        lat_val = st.number_input("Latitude", value=25.4358, format="%.4f")
-    with c3:
-        buffer_val = st.slider("Patch Radius (meters)", 500, 5000, 2000)
+# ----------------------------------------------------------------------------
+# Model & vocabulary loaders
+# ----------------------------------------------------------------------------
+@st.cache_resource
+def load_answer_vocab():
+    vocab_path = "answer_vocab.json"
+    if not os.path.exists(vocab_path):
+        st.warning("answer_vocab.json not found — predictions will show raw class IDs.")
+        return None, None
+    answer_to_id = json.load(open(vocab_path))
+    id_to_answer = {v: k for k, v in answer_to_id.items()}
+    return answer_to_id, id_to_answer
 
-    if st.button("Generate Historical Download Links"):
-        url_85, url_24, err = get_historical_patch_urls(lon_val, lat_val, buffer_val)
-        
-        if url_85 and url_24:
-            st.success("Historical GeoTIFF patches extracted successfully!")
-            dl_col1, dl_col2 = st.columns(2)
-            with dl_col1:
-                st.markdown("#### 📜 1985 Patch (Landsat 5)")
-                st.link_button("Download 1985 GeoTIFF", url_85)
-            with dl_col2:
-                st.markdown("#### 🛰️ 2024 Patch (Landsat 9)")
-                st.link_button("Download 2024 GeoTIFF", url_24)
+@st.cache_resource
+def load_vqa_model(num_classes: int):
+    vqa_config = ILMConfiguration(
+        timm_model_name="resnet50", hf_model_name="prajjwal1/bert-tiny",
+        classes=num_classes, channels=12, image_size=120,
+        network_type=ILMType.VQA_CLASSIFICATION,
+        load_pretrained_timm_if_available=False, load_pretrained_hf_if_available=False,
+    )
+    model = ConfigILM(vqa_config)
+    model.load_state_dict(torch.load("satquery_vqa_finetuned.pt", map_location=device, weights_only=True))
+    model.to(device)
+    model.eval()
+    return model
+
+@st.cache_resource
+def load_s2_classifier():
+    """The BEN-19 scene classifier — used for the grounding tab and as scene-context
+    evidence alongside the VQA answer. Loaded lazily; the app still works without it
+    if reben_publication isn't installed in this environment (grounding tab disables itself)."""
+    try:
+        from reben_publication.BigEarthNetv2_0_ImageClassifier import BigEarthNetv2_0_ImageClassifier
+        m = BigEarthNetv2_0_ImageClassifier.from_pretrained("BIFOLD-BigEarthNetv2-0/resnet50-s2-v0.2.0")
+        return m.to(device).eval()
+    except Exception as e:
+        st.session_state["s2_classifier_error"] = str(e)
+        return None
+
+@st.cache_resource
+def load_tokenizer():
+    return get_default_tokenizer()
+
+@st.cache_resource
+def load_norm_stats():
+    fusion_mean, fusion_std = band_combi_to_mean_std(12)
+    s2_mean, s2_std = band_combi_to_mean_std(10)
+    return (np.array(fusion_mean), np.array(fusion_std)), (np.array(s2_mean), np.array(s2_std))
+
+answer_to_id, id_to_answer = load_answer_vocab()
+num_classes = len(answer_to_id) if answer_to_id else 25
+tokenizer = load_tokenizer()
+(fusion_mean, fusion_std), (s2_mean, s2_std) = load_norm_stats()
+
+with st.spinner("Loading SatQuery AI multimodal weights..."):
+    model = load_vqa_model(num_classes)
+    s2_classifier = load_s2_classifier()
+
+# ----------------------------------------------------------------------------
+# File reading & inference helpers
+# ----------------------------------------------------------------------------
+def read_bands_from_uploads(files, band_names):
+    band_map = {}
+    for f in files:
+        name_upper = f.name.upper()
+        name_no_ext = os.path.splitext(name_upper)[0].strip()
+        if name_no_ext in ["B2", "B3", "B4", "B5", "B6", "B7", "B8"]:
+            name_no_ext = name_no_ext.replace("B", "B0")
+        for b in band_names:
+            if b == name_no_ext or f"_{b}" in name_no_ext or f"-{b}" in name_no_ext:
+                band_map[b] = f
+            elif b in name_upper:
+                if b == "B08" and "B8A" in name_upper:
+                    continue
+                if b not in band_map:
+                    band_map[b] = f
+    return band_map
+
+def load_band_array(uploaded_file):
+    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+        tmp.write(uploaded_file.getbuffer())
+        tmp_path = tmp.name
+    with rasterio.open(tmp_path) as src:
+        arr = src.read(1).astype(np.float32)
+    os.unlink(tmp_path)
+    return arr
+
+def check_band_sanity(band_arrays: dict) -> list:
+    """Flags obviously-broken input (constant/NaN bands) before it produces a
+    meaningless prediction — this is what would have caught the earlier garbage
+    test_patch files immediately instead of three UI iterations later."""
+    warnings = []
+    for b, arr in band_arrays.items():
+        if np.isnan(arr).any():
+            warnings.append(f"{b}: contains NaN values")
+        elif np.std(arr) < 1e-6:
+            warnings.append(f"{b}: constant value ({arr.flat[0]:.1f}) — this band looks like a placeholder, not real imagery")
+    return warnings
+
+def build_fusion_tensor(s1_arrays: dict, s2_arrays: dict):
+    s1 = np.stack([s1_arrays[b] for b in S1_BANDS], axis=0)
+    s2 = np.stack([s2_arrays[b] for b in S2_BANDS_V020], axis=0)
+    stacked = np.concatenate([s1, s2], axis=0)
+    stacked = (stacked - fusion_mean[:, None, None]) / fusion_std[:, None, None]
+    return torch.from_numpy(stacked).unsqueeze(0).float().to(device)
+
+def load_s2_only_tensor(s2_arrays: dict):
+    s2 = np.stack([s2_arrays[b] for b in S2_BANDS_V020], axis=0).astype(np.float32)
+    s2 = (s2 - s2_mean[:, None, None]) / s2_std[:, None, None]
+    return torch.from_numpy(s2).unsqueeze(0).float().to(device)
+
+def run_vqa(question: str, img_tensor: torch.Tensor, top_k: int = 5):
+    q_ids = torch.tensor([tokenizer.encode(question, max_length=32, padding="max_length", truncation=True)]).to(device)
+    with torch.no_grad():
+        logits = model((img_tensor, q_ids))
+    probs = torch.softmax(logits, dim=-1)[0]
+    top_probs, top_idxs = torch.topk(probs, min(top_k, probs.shape[0]))
+    results = []
+    for p, idx in zip(top_probs.tolist(), top_idxs.tolist()):
+        text = id_to_answer.get(idx, f"class_{idx}") if id_to_answer else f"class_{idx}"
+        results.append({"Answer": str(text).capitalize(), "Confidence": p})
+    return results, probs.cpu().numpy()
+
+def humanize_answer(question: str, answer_text: str, confidence: float) -> str:
+    """Turns a raw predicted answer into a full sentence a judge can read without
+    needing to interpret a class label. Purely template-based — no API call needed."""
+    ans_lower = answer_text.strip().lower()
+    confidence_pct = confidence * 100
+
+    if confidence < LOW_CONFIDENCE_THRESHOLD:
+        hedge = f"The model's best guess is **{answer_text}**, but at {confidence_pct:.1f}% confidence this should be treated as uncertain, not a reliable answer."
+        return hedge
+
+    if ans_lower in ("yes", "true"):
+        return f"**Yes** — {question.rstrip('?').strip()}, with {confidence_pct:.1f}% confidence."
+    if ans_lower in ("no", "false"):
+        return f"**No** — based on this imagery, {question[0].lower() + question[1:].rstrip('?')} does not appear to hold, with {confidence_pct:.1f}% confidence."
+    if ans_lower.isdigit():
+        return f"The model estimates **{answer_text}** for this query, with {confidence_pct:.1f}% confidence."
+    return f"**{answer_text}** — with {confidence_pct:.1f}% confidence."
+
+@torch.no_grad()
+def run_scene_classification(s2_arrays: dict, threshold: float = 0.3):
+    if s2_classifier is None:
+        return []
+    x = load_s2_only_tensor(s2_arrays)
+    probs = torch.sigmoid(s2_classifier(x))[0].cpu().numpy()
+    return sorted([(BEN19_CLASSES[i], float(probs[i])) for i in range(19) if probs[i] >= threshold],
+                  key=lambda t: -t[1])
+
+def run_grounding(s2_arrays: dict, class_name: str):
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+    class_idx = BEN19_CLASSES.index(class_name)
+    x = load_s2_only_tensor(s2_arrays)
+    target_layers = [s2_classifier.model.layer4[-1]] if hasattr(s2_classifier, "model") else [s2_classifier.layer4[-1]]
+    cam = GradCAM(model=s2_classifier, target_layers=target_layers)
+    return cam(input_tensor=x, targets=[ClassifierOutputTarget(class_idx)])[0]
+
+def build_pdf_report(question, answer_text, confidence, top5_results, scene_classes, execution_summary) -> bytes:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib import colors
+
+    buf = io.BytesIO()
+    styles = getSampleStyleSheet()
+    story = [
+        Paragraph("SatQuery AI — Analysis Report", styles["Title"]),
+        Paragraph(f"Generated {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}  ·  ISRO SIH PS 26167", styles["Normal"]),
+        Spacer(1, 16),
+        Paragraph(f"<b>Question:</b> {question}", styles["Normal"]),
+        Paragraph(f"<b>Answer:</b> {answer_text} ({confidence*100:.1f}% confidence)", styles["Normal"]),
+        Spacer(1, 12),
+        Paragraph("Top-5 candidate answers", styles["Heading3"]),
+    ]
+    table_data = [["Answer", "Confidence"]] + [[r["Answer"], f"{r['Confidence']*100:.1f}%"] for r in top5_results]
+    t = Table(table_data, colWidths=[3*inch, 1.5*inch])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0b3d91")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 16))
+
+    if scene_classes:
+        story.append(Paragraph("Detected land-cover classes (scene context)", styles["Heading3"]))
+        for cls, p in scene_classes:
+            story.append(Paragraph(f"• {cls} ({p*100:.1f}%)", styles["Normal"]))
+        story.append(Spacer(1, 16))
+
+    story.append(Paragraph("Execution summary (audit trail)", styles["Heading3"]))
+    for k, v in execution_summary.items():
+        story.append(Paragraph(f"<b>{k}:</b> {v}", styles["Normal"]))
+
+    SimpleDocTemplate(buf, pagesize=letter).build(story)
+    return buf.getvalue()
+
+# ----------------------------------------------------------------------------
+# UI Layout
+# ----------------------------------------------------------------------------
+tab_vqa, tab_batch, tab_change, tab_ground, tab_about = st.tabs([
+    "💬 Ask a Question", "📂 Batch Analysis", "🔄 Change Detection", "🎯 Grounding", "ℹ️ About"
+])
+
+# --- Tab 1: Single-Patch VQA ---
+with tab_vqa:
+    st.subheader("Multimodal Visual Question Answering")
+    st.write("Upload a co-registered Sentinel-1 (SAR) and Sentinel-2 (Optical) patch.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        s1_files = st.file_uploader("Sentinel-1 SAR bands (VV, VH)", type=["tif", "tiff"], accept_multiple_files=True, key="vqa_s1")
+    with col2:
+        s2_files = st.file_uploader("Sentinel-2 optical bands (B02–B12)", type=["tif", "tiff"], accept_multiple_files=True, key="vqa_s2")
+
+    st.markdown("### 📝 Query the Model")
+    SUGGESTED_QUESTIONS = [
+        "Is there arable land in this image?",
+        "Is there any inland water in this patch?",
+        "Is there a forested area visible in this scene?",
+        "Is there more arable land than pasture in this image?",
+        "Would you say that any arable land lies next to inland water in this image?",
+        "Use the optical and SAR images together to identify built-up and water-covered regions.",
+        "Write a custom query...",
+    ]
+    selected_q = st.selectbox("Select a query aligned with PS reference categories:", SUGGESTED_QUESTIONS)
+    user_query = st.text_input("Enter your custom query:") if selected_q == "Write a custom query..." else selected_q
+
+    if st.button("🚀 Run AI Analysis", type="primary", key="vqa_run"):
+        if not s1_files or not s2_files:
+            st.warning("⚠️ Upload both Sentinel-1 and Sentinel-2 bands first.")
         else:
-            st.error(f"Could not generate patches: {err}")
-            st.info("Make sure you have authenticated Earth Engine in terminal (`earthengine authenticate`) and set your Google Cloud Project ID.")
+            s1_map = read_bands_from_uploads(s1_files, S1_BANDS)
+            s2_map = read_bands_from_uploads(s2_files, S2_BANDS_V020)
+
+            if len(s1_map) < 2 or len(s2_map) < 10:
+                st.error(f"❌ Missing bands — found {len(s1_map)}/2 SAR bands and {len(s2_map)}/10 optical bands.")
+            else:
+                s1_arrays = {b: load_band_array(s1_map[b]) for b in S1_BANDS}
+                s2_arrays = {b: load_band_array(s2_map[b]) for b in S2_BANDS_V020}
+
+                sanity_warnings = check_band_sanity({**s1_arrays, **s2_arrays})
+                if sanity_warnings:
+                    st.error("⚠️ Input imagery looks broken — results below will be meaningless until this is fixed:")
+                    for w in sanity_warnings:
+                        st.write(f"- {w}")
+
+                with st.spinner("Executing multimodal fusion inference..."):
+                    img_tensor = build_fusion_tensor(s1_arrays, s2_arrays)
+                    top5_results, all_probs = run_vqa(user_query, img_tensor, top_k=5)
+                    answer_text, confidence = top5_results[0]["Answer"], top5_results[0]["Confidence"]
+                    scene_classes = run_scene_classification(s2_arrays)
+
+                banner_class = "answer-banner" if confidence >= LOW_CONFIDENCE_THRESHOLD else "answer-banner answer-banner-lowconf"
+                st.markdown(f"""<div class="{banner_class}">{humanize_answer(user_query, answer_text, confidence)}</div>""",
+                            unsafe_allow_html=True)
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Top Confidence", f"{confidence*100:.1f}%")
+                c2.metric("Input Fusion", "12ch (VV, VH, Optical)")
+                c3.metric("Vocabulary Size", f"{num_classes} classes")
+                c4.metric("Above random?", f"{confidence / (1/num_classes):.1f}×",
+                          help="Confidence relative to random guessing (1/vocabulary size). Above 1x means the model found real signal.")
+
+                colA, colB = st.columns(2)
+                with colA:
+                    st.markdown("#### 📊 Top-5 Candidate Answers")
+                    df_probs = pd.DataFrame(top5_results).sort_values("Confidence", ascending=True)
+                    fig = px.bar(df_probs, x="Confidence", y="Answer", orientation="h",
+                                 color="Confidence", color_continuous_scale="Teal")
+                    fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=260, showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
+                with colB:
+                    st.markdown("#### 📈 Full Confidence Distribution")
+                    st.caption("Shows how 'peaked' vs. 'flat' the model's belief is across all classes — "
+                               "a flat distribution means the model is genuinely unsure, not hiding uncertainty.")
+                    fig2 = go.Figure(data=go.Histogram(x=all_probs, nbinsx=40, marker_color="#1a4d8f"))
+                    fig2.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=260,
+                                        xaxis_title="Probability", yaxis_title="# classes")
+                    st.plotly_chart(fig2, use_container_width=True)
+
+                if scene_classes:
+                    st.markdown("#### 🏞️ Scene Context (BEN-19 land-cover classifier)")
+                    st.caption("Independent evidence from the pretrained scene classifier — supports or contextualizes the VQA answer above.")
+                    df_scene = pd.DataFrame(scene_classes, columns=["Class", "Probability"]).sort_values("Probability")
+                    fig3 = px.bar(df_scene, x="Probability", y="Class", orientation="h", color_discrete_sequence=["#0f9d58"])
+                    fig3.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=max(160, 40 * len(scene_classes)))
+                    st.plotly_chart(fig3, use_container_width=True)
+
+                st.markdown("### 🗺️ Earth Observation Visualizations")
+                vc1, vc2, vc3, vc4 = st.columns(4)
+                vc1.image(get_rgb(s2_arrays), caption="True Color RGB", use_container_width=True)
+                vc2.image(get_false_color(s2_arrays), caption="Color Infrared (Vegetation)", use_container_width=True)
+                vc3.image(get_sar_composite(s1_arrays), caption="SAR Radar Composite", use_container_width=True)
+                fig_ndvi, ax = plt.subplots(figsize=(3, 3))
+                ax.imshow(get_ndvi(s2_arrays), cmap="RdYlGn", vmin=-1, vmax=1)
+                ax.axis("off")
+                fig_ndvi.subplots_adjust(left=0, right=1, bottom=0, top=1)
+                vc4.pyplot(fig_ndvi, use_container_width=True)
+                vc4.caption("NDVI Heatmap")
+
+                execution_summary = {
+                    "selected_task": "visual_question_answering",
+                    "model_backend": "ConfigILM (ResNet-50 + BERT-tiny)",
+                    "input_modality": "Sentinel-1 + Sentinel-2 fusion (12 channels)",
+                    "answer_vocabulary_size": num_classes,
+                    "sanity_warnings": sanity_warnings or "none",
+                }
+                with st.expander("📋 Execution summary (audit trail)"):
+                    st.json(execution_summary)
+
+                pdf_bytes = build_pdf_report(user_query, answer_text, confidence, top5_results, scene_classes, execution_summary)
+                st.download_button("⬇️ Download analysis report (PDF)", data=pdf_bytes,
+                                    file_name="satquery_analysis_report.pdf", mime="application/pdf")
+
+# --- Tab 2: Batch Analysis ---
+with tab_batch:
+    st.subheader("Batch Analysis across Multiple Patches")
+    st.write("Pass a path containing patch subfolders (e.g. `test_patches/`) or a single patch folder.")
+
+    batch_root = st.text_input("Folder path containing patch subfolders:", "test_patches")
+    batch_query = st.text_input("Question to execute across all patches:", "Is there arable land in this image?", key="batch_q")
+
+    if st.button("Run Batch Analysis", key="batch_run"):
+        if not os.path.exists(batch_root):
+            st.error(f"❌ Path not found: `{batch_root}`")
+        else:
+            subdirs = [os.path.join(batch_root, d) for d in os.listdir(batch_root) if os.path.isdir(os.path.join(batch_root, d))]
+            direct_tifs = [f for f in os.listdir(batch_root) if f.endswith((".tif", ".tiff"))]
+            patch_folders = subdirs if len(subdirs) > 0 else ([batch_root] if len(direct_tifs) >= 10 else [])
+
+            if not patch_folders:
+                st.warning("No patch subfolders or complete `.tif` band sets found in the path.")
+            else:
+                results = []
+                progress = st.progress(0.0, text="Processing patches...")
+                for i, pfolder in enumerate(patch_folders):
+                    pname = os.path.basename(pfolder) if pfolder != batch_root else "single_patch"
+                    try:
+                        files_in_dir = [os.path.join(pfolder, f) for f in os.listdir(pfolder) if f.endswith((".tif", ".tiff"))]
+
+                        class MockFile:
+                            def __init__(self, path):
+                                self.name, self.path = os.path.basename(path), path
+                            def getbuffer(self):
+                                return open(self.path, "rb").read()
+
+                        mock_files = [MockFile(p) for p in files_in_dir]
+                        s1_map = read_bands_from_uploads(mock_files, S1_BANDS)
+                        s2_map = read_bands_from_uploads(mock_files, S2_BANDS_V020)
+                        s1_arrays = {b: load_band_array(s1_map[b]) for b in S1_BANDS}
+                        s2_arrays = {b: load_band_array(s2_map[b]) for b in S2_BANDS_V020}
+                        img_tensor = build_fusion_tensor(s1_arrays, s2_arrays)
+                        top5, _ = run_vqa(batch_query, img_tensor, top_k=1)
+                        results.append({"Patch": pname, "Answer": top5[0]["Answer"], "Confidence": f"{top5[0]['Confidence']*100:.1f}%"})
+                    except Exception as e:
+                        results.append({"Patch": pname, "Answer": f"Error: {e}", "Confidence": "N/A"})
+                    progress.progress((i + 1) / len(patch_folders))
+
+                results_df = pd.DataFrame(results)
+                st.dataframe(results_df, use_container_width=True)
+
+                if results_df["Answer"].nunique() == 1 and len(results_df) > 1:
+                    st.warning("⚠️ Every patch got the identical answer — this usually means the model isn't "
+                               "actually responding to image content. Re-check that training used CrossEntropyLoss "
+                               "and real (not placeholder) images.")
+
+                st.download_button("⬇️ Download results as CSV", data=results_df.to_csv(index=False),
+                                    file_name="batch_results.csv")
+
+# --- Tab 3: Change Detection ---
+with tab_change:
+    st.subheader("Bi-Temporal Change Detection")
+    st.write("Upload Sentinel-2 optical bands from two dates of the same area to analyze land-use shifts.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        t1_files = st.file_uploader("Time 1 (Earlier Date)", type=["tif", "tiff"], accept_multiple_files=True, key="cd_t1")
+    with c2:
+        t2_files = st.file_uploader("Time 2 (Later Date)", type=["tif", "tiff"], accept_multiple_files=True, key="cd_t2")
+
+    if st.button("🔄 Analyze Changes", type="primary", key="change_run"):
+        if not t1_files or not t2_files:
+            st.warning("⚠️ Upload Sentinel-2 bands for both dates.")
+        else:
+            t1_map = read_bands_from_uploads(t1_files, S2_BANDS_V020)
+            t2_map = read_bands_from_uploads(t2_files, S2_BANDS_V020)
+            if len(t1_map) < 10 or len(t2_map) < 10:
+                st.error("❌ Missing required optical bands for one or both dates.")
+            else:
+                with st.spinner("Computing bi-temporal spectral divergence..."):
+                    s2_t1 = {b: load_band_array(t1_map[b]) for b in S2_BANDS_V020}
+                    s2_t2 = {b: load_band_array(t2_map[b]) for b in S2_BANDS_V020}
+                    ndvi_diff = get_ndvi(s2_t2) - get_ndvi(s2_t1)
+                    classes_t1 = run_scene_classification(s2_t1)
+                    classes_t2 = run_scene_classification(s2_t2)
+
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.image(get_rgb(s2_t1), caption="Time 1 (RGB)", use_container_width=True)
+                cc2.image(get_rgb(s2_t2), caption="Time 2 (RGB)", use_container_width=True)
+                fig_cd, ax_cd = plt.subplots(figsize=(3, 3))
+                ax_cd.imshow(ndvi_diff, cmap="coolwarm_r", vmin=-0.5, vmax=0.5)
+                ax_cd.axis("off")
+                fig_cd.subplots_adjust(left=0, right=1, bottom=0, top=1)
+                cc3.pyplot(fig_cd, use_container_width=True)
+                cc3.caption("NDVI Divergence (Red = Loss, Blue = Gain)")
+
+                loss_pct = np.mean(ndvi_diff < -0.15) * 100
+                gain_pct = np.mean(ndvi_diff > 0.15) * 100
+                st.info(f"**Vegetation Analytics:** Detected **{loss_pct:.1f}%** vegetation loss and **{gain_pct:.1f}%** vegetation gain.")
+
+                if classes_t1 or classes_t2:
+                    st.markdown("#### 🏞️ Land-cover class changes")
+                    set_t1 = {c for c, _ in classes_t1}
+                    set_t2 = {c for c, _ in classes_t2}
+                    appeared = sorted(set_t2 - set_t1)
+                    disappeared = sorted(set_t1 - set_t2)
+                    colX, colY = st.columns(2)
+                    with colX:
+                        st.write("**New classes (appeared):**")
+                        st.write(", ".join(appeared) if appeared else "None")
+                    with colY:
+                        st.write("**Vanished classes (disappeared):**")
+                        st.write(", ".join(disappeared) if disappeared else "None")
+
+# --- Tab 4: Grounding (satisfies the PS's second mandatory single-image task) ---
+with tab_ground:
+    st.subheader("Text-Guided Region Grounding")
+    st.write("Upload Sentinel-2 bands and highlight where a specific land-cover class is located — "
+             "this satisfies the PS's required additional single-image task (grounding).")
+
+    if s2_classifier is None:
+        st.error("Scene classifier failed to load (reben_publication not available in this environment) — "
+                  "grounding requires it. Run `pip install --no-deps reben-training-scripts` per the notebook setup.")
+    else:
+        g_files = st.file_uploader("Sentinel-2 optical bands (B02–B12)", type=["tif", "tiff"], accept_multiple_files=True, key="ground_s2")
+        if g_files:
+            g_map = read_bands_from_uploads(g_files, S2_BANDS_V020)
+            if len(g_map) >= 10:
+                g_arrays = {b: load_band_array(g_map[b]) for b in S2_BANDS_V020}
+                detected = run_scene_classification(g_arrays, threshold=0.2)
+                if not detected:
+                    st.warning("No classes detected above threshold — try uploading a different patch.")
+                else:
+                    class_options = [c for c, _ in detected]
+                    target_class = st.selectbox("Which class should be highlighted?", class_options)
+                    if st.button("🎯 Generate Grounding Heatmap"):
+                        heatmap = run_grounding(g_arrays, target_class)
+                        rgb = get_rgb(g_arrays)
+                        col1, col2 = st.columns(2)
+                        col1.image(rgb, caption="Original (RGB)", use_container_width=True)
+                        fig, ax = plt.subplots(figsize=(4, 4))
+                        ax.imshow(rgb)
+                        ax.imshow(heatmap, cmap="jet", alpha=0.5)
+                        ax.axis("off")
+                        fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+                        col2.pyplot(fig, use_container_width=True)
+                        col2.caption(f"Grad-CAM: {target_class}")
+
+# --- Tab 5: About ---
+with tab_about:
+    st.subheader("About SatQuery AI")
+    st.markdown("""
+    Built for **ISRO SIH PS 26167** — an agentic multimodal vision-language assistant for Earth observation analysis.
+
+    * **Vision-Language Model:** `ConfigILM` (ResNet-50 + BERT-tiny), vision backbone pretrained on BigEarthNet v2.0.
+    * **Sensor Modality:** Optical–SAR early fusion (Sentinel-1 VV/VH + Sentinel-2 10-band optical).
+    * **Capabilities:** Multimodal VQA, scene classification, bi-temporal change detection, text-guided
+      grounding, multi-patch batch analytics, and downloadable PDF reports.
+    """)
+    c1, c2 = st.columns(2)
+    c1.metric("Vocabulary Size", f"{num_classes} classes")
+    c2.metric("Scene classifier loaded", "Yes" if s2_classifier is not None else "No")
