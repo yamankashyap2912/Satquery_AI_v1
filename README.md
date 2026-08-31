@@ -135,9 +135,6 @@ named or containing the band code (e.g. `B04.tif`, `patch_VV.tif`).
 
 ---
 
-## 🖼️ Screenshot
-
-*(Ask a Question tab — upload panels, query selector, and Run AI Analysis button)*
 
 ---
 
