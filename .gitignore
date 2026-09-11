@@ -10,3 +10,4 @@ test_patch/
 *.zip
 .vscode/
 .DS_Store
+patch_image_cache.pkl

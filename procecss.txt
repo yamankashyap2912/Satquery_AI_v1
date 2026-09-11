@@ -1,0 +1,9 @@
+
+create google cloud and authorize them online
+create project id and provide access in ee 
+
+10m resolution bands (B2, B3, B4, B8) produce $120 \times 120$ pixel grids over a $1.2\text{ km}$ patch.20m and 
+
+60m resolution bands (B1, B5, B6, B7, B8A, B9, B11, B12, VV, VH) produce smaller grids (such as $60 \times 60$ or $20 \times 20$).
+
+take 4.5 hours to train 2000 patch with every 100 patch as checkpoint
