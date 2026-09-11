@@ -11,3 +11,4 @@ pandas
 streamlit
 plotly
 matplotlib
+lmdb
