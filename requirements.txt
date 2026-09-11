@@ -12,3 +12,4 @@ streamlit
 plotly
 matplotlib
 lmdb
+reportlab
