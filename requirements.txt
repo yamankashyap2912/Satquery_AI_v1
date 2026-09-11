@@ -7,3 +7,8 @@ opencv-python-headless
 pandas
 configilm @ git+https://github.com/lhackel-tub/ConfigILM.git@0a3d4f5c6eae7b4487765a915dc44fa305246891
 # Add any other direct imports you have in app_v6.py
+pandas
+streamlit
+plotly.express
+plotly.graph_objects
+matplotlib
